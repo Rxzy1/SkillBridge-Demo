@@ -1,5 +1,4 @@
 from jose import jwt
-from jose.exceptions import JWTError
 from datetime import datetime, timedelta
 from passlib.context import CryptContext
 import os
