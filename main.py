@@ -2,9 +2,8 @@ from fastapi import FastAPI, Depends, HTTPException
 from sqlalchemy.orm import Session
 from database import get_db, Base, engine
 from models import User
-from schemas import SignupRequest
-from auth import create_token, hash_password
-import models
+from schemas import SignupRequest,LoginRequest
+from auth import create_token, hash_password, verify_password
 
 Base.metadata.create_all(bind=engine)
 
@@ -18,7 +17,7 @@ def root():
 async def signup(request: SignupRequest, db: Session = Depends(get_db)):
     existing = db.query(User).filter(User.email == request.email).first()
     if existing:
-        raise HTTPException(status_code=400, detail="Email already exists")
+        raise HTTPException(status_code=400, detail="Email already exists,Please Log in")
     new_user = User(
         name=request.name,
         email=request.email,
@@ -29,4 +28,14 @@ async def signup(request: SignupRequest, db: Session = Depends(get_db)):
     db.commit()
     db.refresh(new_user)
     token = create_token({"user_id": new_user.id, "role": new_user.role})
+    return {"access_token": token, "token_type": "bearer"}
+
+@app.post("/auth/login")
+async def login(request:LoginRequest,db: Session = Depends(get_db)):
+    existing = db.query(User).filter(User.email == request.email).first()
+    if existing is None:
+        raise HTTPException(status_code=401, detail="Email doesn't exist")
+    if not verify_password(request.password,existing.hashed_password):
+        raise HTTPException(status_code=401, detail="Invalid Password")
+    token = create_token({"user_id": existing.id, "role": existing.role})
     return {"access_token": token, "token_type": "bearer"}
