@@ -1,13 +1,19 @@
 from fastapi import FastAPI, Depends, HTTPException
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from sqlalchemy.orm import Session
+from jose import JWTError
 from datetime import datetime, timedelta
 import uuid
+import logging
 
 from database import get_db, Base, engine
 from models import User, Batch, Session as SessionModel, BatchStudent, Attendance, BatchInvite
 from schemas import SignupRequest, LoginRequest, BatchRequest, Create_Sessions, Mark_Attendance, JoinClassRequest
 from auth import create_token, hash_password, verify_password, decode_token
+
+# set up basic logging so we can see what's happening
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 Base.metadata.create_all(bind=engine)
 
@@ -22,8 +28,12 @@ def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(securit
         token = credentials.credentials
         payload = decode_token(token)
         return {"user_id": payload["user_id"], "role": payload["role"]}
-    except:
+    except JWTError as e:
+        logger.warning(f"JWT decode failed: {e}")
         raise HTTPException(status_code=401, detail="Invalid or expired token")
+    except KeyError as e:
+        logger.warning(f"Token missing required field: {e}")
+        raise HTTPException(status_code=401, detail="Invalid token payload")
 
 
 @app.get("/")
@@ -47,6 +57,7 @@ async def signup(request: SignupRequest, db: Session = Depends(get_db)):
     db.commit()
     db.refresh(new_user)
     token = create_token({"user_id": new_user.id, "role": new_user.role})
+    logger.info(f"New user signed up: {new_user.email} ({new_user.role})")
     return {"access_token": token, "token_type": "bearer"}
 
 
@@ -59,6 +70,7 @@ async def login(request: LoginRequest, db: Session = Depends(get_db)):
     if not verify_password(request.password, existing.hashed_password):
         raise HTTPException(status_code=401, detail="Invalid credentials")
     token = create_token({"user_id": existing.id, "role": existing.role})
+    logger.info(f"User logged in: {existing.email}")
     return {"access_token": token, "token_type": "bearer"}
 
 
