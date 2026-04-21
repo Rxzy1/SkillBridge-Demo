@@ -5,7 +5,7 @@ from jose import JWTError
 from datetime import datetime, timedelta
 import uuid
 import logging
-
+import os
 from database import get_db, Base, engine
 from models import User, Batch, Session as SessionModel, BatchStudent, Attendance, BatchInvite
 from schemas import SignupRequest, LoginRequest, BatchRequest, Create_Sessions, Mark_Attendance, JoinClassRequest
@@ -225,3 +225,83 @@ async def mark_attendance(
         "status": new_attendance.status,
         "marked_at": new_attendance.marked_at
     }
+
+# read environment variable for monitoring
+MONITORING_API_KEY = os.getenv("MONITORING_API_KEY")
+
+
+@app.get("/sessions/{session_id}/attendance")
+async def get_session_attendance(
+        session_id: int,
+        db: Session = Depends(get_db),
+        current_user: dict = Depends(get_current_user)
+):
+    if current_user["role"] != "trainer":
+        raise HTTPException(status_code=403, detail="Access Denied")
+    session = db.query(SessionModel).filter(SessionModel.id == session_id).first()
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    records = db.query(Attendance).filter(Attendance.session_id == session_id).all()
+    return [
+        {
+            "id": r.id,
+            "student_id": r.student_id,
+            "status": r.status,
+            "marked_at": r.marked_at
+        }
+        for r in records
+    ]
+
+
+@app.post("/auth/monitoring-token")
+async def get_monitoring_token(
+        key: dict,
+        current_user: dict = Depends(get_current_user)
+):
+    # step 1 — caller must be a monitoring officer
+    if current_user["role"] != "monitoring_officer":
+        raise HTTPException(status_code=403, detail="Only monitoring officers can access this")
+
+    # step 2 — verify the secret API key
+    if key.get("key") != MONITORING_API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid API key")
+
+    # step 3 — issue a scoped token valid for 1 hour
+    scoped_token = create_token({
+        "user_id": current_user["user_id"],
+        "role": "monitoring_officer",
+        "scope": "monitoring"
+    },expires_in_hours=1)
+    return {"monitoring_token": scoped_token, "expires_in": "1 hour"}
+
+
+@app.get("/monitoring/attendance")
+async def monitoring_attendance(
+        credentials: HTTPAuthorizationCredentials = Depends(security),
+        db: Session = Depends(get_db)
+):
+    # validate the scoped monitoring token specifically
+    try:
+        token = credentials.credentials
+        payload = decode_token(token)
+        # this endpoint needs the scoped token, not the standard login token
+        if payload.get("scope") != "monitoring":
+            raise HTTPException(status_code=401, detail="Monitoring token required")
+        if payload.get("role") != "monitoring_officer":
+            raise HTTPException(status_code=403, detail="Access Denied")
+    except JWTError:
+        raise HTTPException(status_code=401, detail="Invalid or expired monitoring token")
+    except KeyError:
+        raise HTTPException(status_code=401, detail="Invalid token payload")
+
+    records = db.query(Attendance).all()
+    return [
+        {
+            "id": r.id,
+            "session_id": r.session_id,
+            "student_id": r.student_id,
+            "status": r.status,
+            "marked_at": r.marked_at
+        }
+        for r in records
+    ]
