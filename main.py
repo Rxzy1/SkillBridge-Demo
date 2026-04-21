@@ -7,11 +7,13 @@ import uuid
 import logging
 import os
 from database import get_db, Base, engine
-from models import User, Batch, Session as SessionModel, BatchStudent, Attendance, BatchInvite
+from models import User, Batch, Session as SessionModel, BatchStudent, Attendance, BatchInvite, BatchTrainer
 from schemas import SignupRequest, LoginRequest, BatchRequest, Create_Sessions, Mark_Attendance, JoinClassRequest
 from auth import create_token, hash_password, verify_password, decode_token
 
 
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 Base.metadata.create_all(bind=engine)
 
@@ -45,18 +47,28 @@ async def signup(request: SignupRequest, db: Session = Depends(get_db)):
     existing = db.query(User).filter(User.email == request.email).first()
     if existing:
         raise HTTPException(status_code=400, detail="Email already exists, please log in")
+    if request.role == "trainer":
+        if not request.institution_id:
+            raise HTTPException(status_code=400, detail="Institution id is required")
+        institution = db.query(User).filter(
+            User.id == request.institution_id,
+            User.role =="institution"
+        ).first()
+        if not institution:
+            raise HTTPException(status_code=404,detail="Institution not found")
     new_user = User(
         name=request.name,
         email=request.email,
         hashed_password=hash_password(request.password),
-        role=request.role
+        role=request.role,
+        institution_id = request.institution_id
     )
     db.add(new_user)
     db.commit()
     db.refresh(new_user)
     token = create_token({"user_id": new_user.id, "role": new_user.role})
     logger.info(f"New user signed up: {new_user.email} ({new_user.role})")
-    return {"access_token": token, "token_type": "bearer"}
+    return {"access_token": token, "token_type": "bearer","user_id":new_user.id}
 
 
 @app.post("/auth/login")
@@ -80,13 +92,26 @@ async def create_batch(
 ):
     if current_user["role"] not in ["trainer", "institution"]:
         raise HTTPException(status_code=403, detail="Access Denied")
+    if current_user["role"] == "trainer":
+        # trainers belong to an institution
+        trainer_user = db.query(User).filter(User.id == current_user["user_id"]).first()
+        if not trainer_user.institution_id:
+            raise HTTPException(status_code=400, detail="Trainer is not linked to an institution")
+        owner_institution_id = trainer_user.institution_id
+    else:
+        # institution creates the batch under themselves
+        owner_institution_id = current_user["user_id"]
     new_batch = Batch(
         name=request.name,
-        institution_id=current_user["user_id"]
+        institution_id=owner_institution_id
     )
     db.add(new_batch)
     db.commit()
     db.refresh(new_batch)
+    # if a trainer created the batch, register them in batch_trainers so ownership checks work
+    if current_user["role"] == "trainer":
+        db.add(BatchTrainer(batch_id=new_batch.id, trainer_id=current_user["user_id"]))
+        db.commit()
     return {"id": new_batch.id, "name": new_batch.name, "institution_id": new_batch.institution_id}
 
 
@@ -101,6 +126,16 @@ async def create_session(
     batch = db.query(Batch).filter(Batch.id == request.batch_id).first()
     if not batch:
         raise HTTPException(status_code=404, detail="Batch not found")
+    # only trainers assigned to this batch can create sessions
+    assigned = db.query(BatchTrainer).filter(
+        BatchTrainer.batch_id == request.batch_id,
+        BatchTrainer.trainer_id == current_user["user_id"]
+    ).first()
+    if not assigned:
+        raise HTTPException(status_code=403, detail="You are not assigned to this batch")
+    # end_time must come after start_time
+    if request.end_time <= request.start_time:
+        raise HTTPException(status_code=400, detail="end_time must be after start_time")
     # prevent the same batch from having two sessions at the same time
     existing_session = db.query(SessionModel).filter(
         SessionModel.batch_id == request.batch_id,
@@ -142,6 +177,13 @@ async def create_invite(
     batch = db.query(Batch).filter(Batch.id == batch_id).first()
     if not batch:
         raise HTTPException(status_code=404, detail="Batch not found")
+    # only trainers assigned to this batch can generate invites
+    assigned = db.query(BatchTrainer).filter(
+        BatchTrainer.batch_id == batch_id,
+        BatchTrainer.trainer_id == current_user["user_id"]
+    ).first()
+    if not assigned:
+        raise HTTPException(status_code=403, detail="You are not assigned to this batch")
     # generate a random unique token, valid for 7 days
     token = str(uuid.uuid4())
     new_invite = BatchInvite(
@@ -166,8 +208,7 @@ async def join_batch(
     invite = db.query(BatchInvite).filter(BatchInvite.token == request.token).first()
     if not invite:
         raise HTTPException(status_code=404, detail="Invalid token")
-    if invite.used:
-        raise HTTPException(status_code=400, detail="Token already used")
+    # token is reusable — each student uses the same invite link to join the batch
     if invite.expires_at < datetime.utcnow():
         raise HTTPException(status_code=400, detail="Token has expired")
     # block duplicate enrollment in the same batch
@@ -181,7 +222,6 @@ async def join_batch(
         student_id=current_user["user_id"],
         batch_id=invite.batch_id
     )
-    invite.used = True
     db.add(new_enrollment)
     db.commit()
     return {"message": "Successfully joined batch", "batch_id": invite.batch_id}
@@ -242,6 +282,9 @@ async def get_session_attendance(
     session = db.query(SessionModel).filter(SessionModel.id == session_id).first()
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
+    # trainers can only view attendance for sessions they own
+    if session.trainer_id != current_user["user_id"]:
+        raise HTTPException(status_code=403, detail="You do not own this session")
     records = db.query(Attendance).filter(Attendance.session_id == session_id).all()
     return [
         {
@@ -263,8 +306,8 @@ async def get_monitoring_token(
     if current_user["role"] != "monitoring_officer":
         raise HTTPException(status_code=403, detail="Only monitoring officers can access this")
 
-    # step 2 — verify the secret API key
-    if key.get("key") != MONITORING_API_KEY:
+    # step 2 — verify the secret API key; also reject outright if the env var was never set
+    if not MONITORING_API_KEY or key.get("key") != MONITORING_API_KEY:
         raise HTTPException(status_code=401, detail="Invalid API key")
 
     # step 3 — issue a scoped token valid for 1 hour
@@ -307,3 +350,143 @@ async def monitoring_attendance(
             "status": r.status,
             "marked_at": r.marked_at}
         for r in records]
+
+
+@app.get("/batches/{batch_id}/summary")
+async def batch_summary(
+        batch_id: int,
+        db: Session = Depends(get_db),
+        current_user: dict = Depends(get_current_user)
+):
+    if current_user["role"] != "institution":
+        raise HTTPException(status_code=403, detail="Access Denied")
+
+    batch = db.query(Batch).filter(Batch.id == batch_id).first()
+    if not batch:
+        raise HTTPException(status_code=404, detail="Batch not found")
+
+    # institution can only see their own batches
+    if batch.institution_id != current_user["user_id"]:
+        raise HTTPException(status_code=403, detail="This batch does not belong to your institution")
+
+    enrollments = db.query(BatchStudent).filter(BatchStudent.batch_id == batch_id).all()
+    sessions = db.query(SessionModel).filter(SessionModel.batch_id == batch_id).all()
+    session_ids = [s.id for s in sessions]
+
+    student_summaries = []
+    for enrollment in enrollments:
+        student = db.query(User).filter(User.id == enrollment.student_id).first()
+        records = db.query(Attendance).filter(
+            Attendance.student_id == enrollment.student_id,
+            Attendance.session_id.in_(session_ids)
+        ).all()
+        student_summaries.append({
+            "student_id": student.id,
+            "name": student.name,
+            "present": sum(1 for r in records if r.status == "present"),
+            "absent": sum(1 for r in records if r.status == "absent"),
+            "late": sum(1 for r in records if r.status == "late")
+        })
+
+    return {
+        "batch_id": batch.id,
+        "batch_name": batch.name,
+        "total_sessions": len(sessions),
+        "students": student_summaries
+    }
+
+
+@app.get("/institutions/{institution_id}/summary")
+async def institution_summary(
+        institution_id: int,
+        db: Session = Depends(get_db),
+        current_user: dict = Depends(get_current_user)
+):
+    if current_user["role"] != "programme_manager":
+        raise HTTPException(status_code=403, detail="Access Denied")
+
+    institution = db.query(User).filter(
+        User.id == institution_id,
+        User.role == "institution"
+    ).first()
+    if not institution:
+        raise HTTPException(status_code=404, detail="Institution not found")
+
+    batches = db.query(Batch).filter(Batch.institution_id == institution_id).all()
+
+    batch_summaries = []
+    for batch in batches:
+        sessions = db.query(SessionModel).filter(SessionModel.batch_id == batch.id).all()
+        session_ids = [s.id for s in sessions]
+
+        batch_summaries.append({
+            "batch_id": batch.id,
+            "batch_name": batch.name,
+            "total_sessions": len(sessions),
+            "total_present": db.query(Attendance).filter(
+                Attendance.session_id.in_(session_ids),
+                Attendance.status == "present"
+            ).count(),
+            "total_absent": db.query(Attendance).filter(
+                Attendance.session_id.in_(session_ids),
+                Attendance.status == "absent"
+            ).count(),
+            "total_late": db.query(Attendance).filter(
+                Attendance.session_id.in_(session_ids),
+                Attendance.status == "late"
+            ).count()
+        })
+
+    return {
+        "institution_id": institution.id,
+        "institution_name": institution.name,
+        "batches": batch_summaries
+    }
+
+
+@app.get("/programme/summary")
+async def programme_summary(
+        db: Session = Depends(get_db),
+        current_user: dict = Depends(get_current_user)
+):
+    if current_user["role"] != "programme_manager":
+        raise HTTPException(status_code=403, detail="Access Denied")
+
+    institutions = db.query(User).filter(User.role == "institution").all()
+
+    summary = []
+    for inst in institutions:
+        batches = db.query(Batch).filter(Batch.institution_id == inst.id).all()
+        total_sessions = 0
+        total_present = 0
+        total_absent = 0
+        total_late = 0
+
+        for batch in batches:
+            sessions = db.query(SessionModel).filter(SessionModel.batch_id == batch.id).all()
+            session_ids = [s.id for s in sessions]
+            total_sessions += len(sessions)
+            total_present += db.query(Attendance).filter(
+                Attendance.session_id.in_(session_ids),
+                Attendance.status == "present"
+            ).count()
+            total_absent += db.query(Attendance).filter(
+                Attendance.session_id.in_(session_ids),
+                Attendance.status == "absent"
+            ).count()
+            total_late += db.query(Attendance).filter(
+                Attendance.session_id.in_(session_ids),
+                Attendance.status == "late"
+            ).count()
+
+        summary.append({
+            "institution_id": inst.id,
+            "institution_name": inst.name,
+            "total_batches": len(batches),
+            "total_sessions": total_sessions,
+            "total_present": total_present,
+            "total_absent": total_absent,
+            "total_late": total_late
+        })
+
+    return {"programme_summary": summary}

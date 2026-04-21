@@ -20,6 +20,7 @@ class SignupRequest(BaseModel):
     email: EmailStr
     password: str
     role: UserRole
+    institution_id : int| None = None
 
 
 class LoginRequest(BaseModel):
