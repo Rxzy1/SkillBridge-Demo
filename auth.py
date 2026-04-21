@@ -20,7 +20,7 @@ def verify_password(plain: str, hashed: str) -> bool:
 def create_token(data: dict,expires_in_hours:int = 24) -> str:
     payload = data.copy()
     payload["iat"]=datetime.utcnow()
-    payload["exp"] = datetime.utcnow() + timedelta(expires_in_hours)
+    payload["exp"] = datetime.utcnow() + timedelta(hours=expires_in_hours)
     return jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)
 
 def decode_token(token: str) -> dict:

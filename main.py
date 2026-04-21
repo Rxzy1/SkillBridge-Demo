@@ -11,9 +11,7 @@ from models import User, Batch, Session as SessionModel, BatchStudent, Attendanc
 from schemas import SignupRequest, LoginRequest, BatchRequest, Create_Sessions, Mark_Attendance, JoinClassRequest
 from auth import create_token, hash_password, verify_password, decode_token
 
-# set up basic logging so we can see what's happening
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+
 
 Base.metadata.create_all(bind=engine)
 
@@ -100,6 +98,9 @@ async def create_session(
 ):
     if current_user["role"] != "trainer":
         raise HTTPException(status_code=403, detail="Access Denied")
+    batch = db.query(Batch).filter(Batch.id == request.batch_id).first()
+    if not batch:
+        raise HTTPException(status_code=404, detail="Batch not found")
     # prevent the same batch from having two sessions at the same time
     existing_session = db.query(SessionModel).filter(
         SessionModel.batch_id == request.batch_id,
@@ -274,12 +275,15 @@ async def get_monitoring_token(
     },expires_in_hours=1)
     return {"monitoring_token": scoped_token, "expires_in": "1 hour"}
 
+@app.api_route("/monitoring/attendance", methods=["POST", "PUT", "DELETE", "PATCH"])
+async def monitoring_attendance_405():
+    raise HTTPException(status_code=405, detail="Method Not Allowed")
+
 
 @app.get("/monitoring/attendance")
 async def monitoring_attendance(
         credentials: HTTPAuthorizationCredentials = Depends(security),
-        db: Session = Depends(get_db)
-):
+        db: Session = Depends(get_db)):
     # validate the scoped monitoring token specifically
     try:
         token = credentials.credentials
@@ -301,7 +305,5 @@ async def monitoring_attendance(
             "session_id": r.session_id,
             "student_id": r.student_id,
             "status": r.status,
-            "marked_at": r.marked_at
-        }
-        for r in records
-    ]
+            "marked_at": r.marked_at}
+        for r in records]
